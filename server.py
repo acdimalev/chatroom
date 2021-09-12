@@ -5,6 +5,7 @@ BUFFER_SIZE = 4096
 
 sockets = [(0, None)] * MAX_SOCKETS
 buffers = [b''] * MAX_SOCKETS
+lines = [[]] * MAX_SOCKETS
 
 connections = []
 
@@ -49,8 +50,8 @@ while True:
     for (n, i) in enumerate(connections):
         try:
             recvbuf = fancyrecv(sockets[i][1], BUFFER_SIZE - len(buffers[i]))
-            if recvbuf:
-                print(f"{i} > {recvbuf}")
+            # if recvbuf:
+            #     print(f"{i} > {recvbuf}")
             buffers[i] += recvbuf
         except EOFError:
             sockets[i][1].close()
@@ -59,3 +60,11 @@ while True:
             print(f"closed connection {i}")
 
     connections = [x for x in connections if x is not None]
+
+
+    # split buffers into lines
+
+    for i in connections:
+        (*lines[i], buffers[i]) = buffers[i].translate(None, delete=b'\r').split(b'\n')
+        for line in lines[i]:
+            print(f"{i} > {line}")
