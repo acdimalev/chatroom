@@ -90,6 +90,7 @@ while True:
 
 
     # split buffers into lines
+    # TODO: disconnect connections with full buffers that do not parse into lines
 
     for i in connections:
         (*lines[i], buffers[i]) = buffers[i].translate(None, delete=b'\r').split(b'\n')
