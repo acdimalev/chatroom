@@ -1,15 +1,64 @@
+from dataclasses import dataclass
 from socket import create_server
 from time import sleep
 
-MAX_SOCKETS = 1024
-BUFFER_SIZE = 4096
+CONNECTIONS_MAX = 1024
+IN_BUFFER_MAX = 4096
+IN_MESSAGE_MAX = 4
 
-sockets = [(0, None)] * MAX_SOCKETS
-buffers = [b''] * MAX_SOCKETS
-lines = [[]] * MAX_SOCKETS
-messages = [[]] * MAX_SOCKETS
 
-connections = []
+@dataclass
+class Message:
+    prefix: bytes
+    command: bytes
+    params: list[bytes]
+
+
+@dataclass
+class Connection:
+    socket: int
+    in_buffer: bytes
+    in_messages: list[Message]
+
+
+class PoolExhaustedException(BaseException):
+    pass
+
+
+class Pool:
+
+    def __init__(self, size):
+        self._items = {}
+        self._next_reference = 0
+        self._size = size
+
+    def __iter__(self):
+        return iter(self._items)
+
+    def __len__(self):
+        return len(self._items)
+
+    def __getitem__(self, reference):
+        return self._items[reference]
+
+    def __delitem__(self, reference):
+        del self._items[reference]
+
+    def append(self, item):
+        if self._size < 1 + len(self._items):
+            raise PoolExhaustedException
+        reference = self._next_reference
+        self._items[reference] = item
+        self._next_reference = 1 + reference
+        return reference
+
+    def items(self):
+        return iter(self._items.items())
+
+
+connections = Pool(CONNECTIONS_MAX)
+drop_connections = []
+
 
 # invert EOF behavior
 def fancyrecv(socket, buffersize):
@@ -45,7 +94,7 @@ def parse(line):
         params = []
     if line:
         params += [line]
-    return (prefix, command, params)
+    return Message(prefix, command, params)
 
 server = create_server(("localhost", 6667))
 server.setblocking(False)
@@ -53,60 +102,70 @@ server.setblocking(False)
 # FIXME: server should gracefully handle interrupts for termination
 while True:
 
-    # handle connections
+    # handle new connections
     # one per iteration
 
     try:
         (socket, _) = server.accept()
         socket.setblocking(False)
-        i = [x[1] for x in sockets].index(None)
-        sockets[i] = (1 + sockets[i][0], socket)
-        buffers[i] = b''
-        lines[i] = []
-        messages[i] = []
-        connections.append(i)
-        print(f"received connection {i}")
+        connection_reference = connections.append(Connection(
+            socket=socket,
+            in_buffer=b'',
+            in_messages=[],
+        ))
+        print(f"received connection {connection_reference}")
     except BlockingIOError:
         pass
-    except ValueError:
+    except PoolExhaustedException:
         socket.close()
 
 
-    # read from connections
+    # process connection input
 
-    for (n, i) in enumerate(connections):
+    for (connection_reference, connection) in connections.items():
+
+        # read from connections
         try:
-            recvbuf = fancyrecv(sockets[i][1], BUFFER_SIZE - len(buffers[i]))
-            # if recvbuf:
-            #     print(f"{i} > {recvbuf}")
-            buffers[i] += recvbuf
+            connection.in_buffer += fancyrecv(
+                connection.socket, IN_BUFFER_MAX - len(connection.in_buffer),
+            )
         except EOFError:
-            sockets[i][1].close()
-            sockets[i] = (sockets[i][0], None)
-            connections[n] = None
-            print(f"closed connection {i}")
+            drop_connections.append(connection_reference)
 
-    connections = [x for x in connections if x is not None]
+        # strip carriage returns out of the in-buffer
+        connection.in_buffer = connection.in_buffer.translate(None, delete=b'\r')
+
+        # split buffers into lines
+        (*in_lines, connection.in_buffer) = connection.in_buffer.split(
+            b'\n', IN_MESSAGE_MAX - len(connection.in_messages),
+        )
+
+        # disconnect connections with full buffers that do not parse into lines
+        if (IN_BUFFER_MAX == len(connection.in_buffer) and 0 == len(in_lines)):
+            drop_connections.append(connection_reference)
+
+        # parse lines into messages
+        connection.in_messages += map(parse, in_lines)
 
 
-    # split buffers into lines
-    # TODO: disconnect connections with full buffers that do not parse into lines
+    # pump messages to stdout for development
 
-    for i in connections:
-        (*lines[i], buffers[i]) = buffers[i].translate(None, delete=b'\r').split(b'\n')
-        # for line in lines[i]:
-        #     print(f"{i} > {line}")
+    for (connection_reference, connection) in connections.items():
+        for message in connection.in_messages:
+            print(f"{connection_reference} > {message}")
+
+        connection.in_messages = []
 
 
-    # parse lines into messages
+    # process dropped connections
 
-    for i in connections:
-        messages[i] = [
-            parse(line)
-            for line in lines[i]
-        ]
-        for message in messages[i]:
-            print(f"{i} > {message}")
+    for connection_reference in drop_connections:
+        if connection_reference in connections:
+            connections[connection_reference].socket.close()
+            del connections[connection_reference]
+            print(f"closed connection {connection_reference}")
+
+    drop_connections = []
 
 
     sleep(1/30.0)
